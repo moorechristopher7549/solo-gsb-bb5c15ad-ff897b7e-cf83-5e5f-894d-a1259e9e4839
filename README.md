@@ -11,7 +11,10 @@
 insert/replace/delete，整批原子生效，参与者与公共位置按台词身份自动重排。
 导演可批量设置 **台词止点**：演员上报仍按 quorum 汇聚，但自动推进不得越过
 最靠前的未释放止点；放行止点时原子递增 `hold_version` 并立即用当前活跃
-参与者重算，满足条件可在同一响应中继续推进。
+参与者重算，满足条件可在同一响应中继续推进。导演还可设置 **循环排练区间**
+（`loop_version` 乐观锁）：quorum 达到或越过终点时在同一事务内把公共位置
+回到起点、递增 `progress_epoch`、清空参与者进度并累加 `loop_count`；终点
+上有未释放止点时只停在终点，放行后按当前活跃进度重算，满足条件才回环。
 
 ## 快速启动（单条命令）
 
@@ -105,6 +108,36 @@ curl -X POST http://localhost:8000/rooms/demo/holds/release \
   -H 'Content-Type: application/json' \
   -d '{"expected_hold_version":1,"positions":[1]}'
 # → {"released":[1],"hold_version":2,"advancement":{"position":...},"pending_holds":[2],"state":{...}}
+
+# 11. 循环排练区间（另开一个干净的房间演示，止点与循环可叠加但各自独立）
+curl -X POST http://localhost:8000/rooms -H 'Content-Type: application/json' \
+  -d '{"id":"loop-demo","name":"循环段落","advance_threshold":2,"offline_timeout_seconds":30}'
+curl -X POST http://localhost:8000/rooms/loop-demo/lines -H 'Content-Type: application/json' \
+  -d '{"lines":["甲：你好。","乙：来了？","甲：请坐。","乙：谢谢。","甲：开始吧。"]}'
+
+# 设置起点 1、终点 3（loop_version 乐观锁）：
+# 两行须属于当前台本、start < end，且 end 严格高于当前公共位置
+curl -X PUT http://localhost:8000/rooms/loop-demo/loop \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_loop_version":0,"start":1,"end":3}'
+# → {"changed":true,"enabled":true,"start":1,"end":3,"loop_version":1,"loop_count":0,"state":{...}}
+
+# 演员照常上报；quorum（2 人）达到或越过终点 3 时同一事务内：
+# 公共位置回到起点 1、progress_epoch 递增、参与者进度清空、loop_count +1
+# 上报响应中的 advancement 形如：
+# {"position":1,"looped":true,"loop_end":3,"loop_count":1,"progress_epoch":2,...}
+# 此后演员必须携带新的 progress_epoch 上报；旧代际的迟到/重试事件返回 409
+curl http://localhost:8000/rooms/loop-demo/state
+# → {"loop":{"enabled":true,"start":1,"end":3,"loop_version":1,"loop_count":1},
+#    "loop_version":1,"loop_count":1,"progress_epoch":2,...}
+
+# 相同区间重复设置为幂等空操作（loop_version 不递增）；清除循环：
+curl -X PUT http://localhost:8000/rooms/loop-demo/loop \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_loop_version":1}'
+# → {"changed":true,"enabled":false,"start":null,"end":null,"loop_version":2,"loop_count":1,...}
+# 注：清除保留累计 loop_count；整体导入台本才清零。整体导入/增量修订台本都会
+#     清除循环，且此前确有循环时递增 loop_version。
 ```
 
 ## API 一览
@@ -121,7 +154,8 @@ curl -X POST http://localhost:8000/rooms/demo/holds/release \
 | PUT    | `/rooms/{room_id}/cursor`       | 导演校准公共位置，可前跳/回退（进度代际乐观锁） |
 | PUT    | `/rooms/{room_id}/holds`        | 批量设置未释放止点（`hold_version` 乐观锁，追加语义） |
 | POST   | `/rooms/{room_id}/holds/release` | 放行止点：版本递增后立即重算，可同响应继续推进 |
-| GET    | `/rooms/{room_id}/state`        | 当前活跃成员、公共位置、止点与最近一次阻挡信息 |
+| PUT    | `/rooms/{room_id}/loop`         | 设置/清除循环排练区间（`loop_version` 乐观锁） |
+| GET    | `/rooms/{room_id}/state`        | 当前活跃成员、公共位置、止点、循环配置与最近一次阻挡信息 |
 | GET    | `/rooms/{room_id}/advancements` | 完整推进历史（含每次推进原因）             |
 | GET    | `/health`                       | 健康检查                                   |
 
@@ -132,9 +166,9 @@ curl -X POST http://localhost:8000/rooms/demo/holds/release \
   客户端可安全重试。
 - **进度代际（progress_epoch）**：演员上报必须携带当前 `progress_epoch`
   （由 `/state` 获取；房间创建时为 0，首次导入台本后为 1）。导演校准公共
-  位置或台本整体重导都会开启新代际；**旧代际的延迟或重试事件返回 409**，
-  既不被记录也不能重新推进房间。`GET /rooms/{room_id}`、`/state` 以及上报
-  响应均返回当前代际。
+  位置、循环回环或台本整体重导都会开启新代际；**旧代际的延迟或重试事件
+  返回 409**，既不被记录也不能重新推进房间。`GET /rooms/{room_id}`、
+  `/state` 以及上报响应均返回当前代际。
 - **导演校准公共位置**（`PUT /rooms/{room_id}/cursor`，请求体
   `{"expected_progress_epoch": <当前代际>, "position": <目标行号>}`）：
   允许**前跳或回退**，与台本版本、时钟状态相互独立（暂停期间也可校准）。
@@ -180,6 +214,34 @@ curl -X POST http://localhost:8000/rooms/demo/holds/release \
   - 时钟与止点相互独立：暂停期间导演仍可设置/放行止点；放行时按暂停冻结
     的活跃集合重算。`hold_version` 与 `revision`、`progress_epoch`、
     `clock_version` 互不影响。
+- **循环排练区间（loop）**：导演用 `PUT /rooms/{room_id}/loop` 设置或清除。
+  - 请求体为 `{"expected_loop_version": <当前版本>, "start": <起点>, "end": <终点>}`
+    时设置区间；省略 `start`/`end`（两者都为 `null` 或不传）时清除循环。
+  - **设置校验**：房间尚未导入台词 → **409**；起止行必须都属于当前台本
+    （`end < 台词总数`，越界 → **422**）；必须 `start < end`（请求体校验
+    **422**）；**终点必须严格高于当前公共位置**（`end > public_position`，
+    否则 **422**；起点可以低于当前公共位置）。版本不匹配 → **409**，状态不变。
+  - **幂等**：目标配置与当前完全一致（相同起止行，或本就无循环时再次清除）
+    时为空操作，返回 `changed: false`、`loop_version` 不递增（即使携带过期
+    版本也视为成功重试）；真正设置/清除时 `loop_version` 原子递增。设置/
+    清除本身不触发推进重算，也不改变 `progress_epoch`、参与者进度或止点。
+  - **回环**：启用后，演员上报或放行重算得到的 quorum 候选位置**达到或越过
+    终点**（`candidate >= end`）时，在**同一事务**内：公共位置回到 `start`、
+    `progress_epoch` 递增、**清空全部参与者进度**、`loop_count` 累加 1，并
+    写入一条“循环回环”推进记录（`contributors` 为达到/越过终点的参与者）。
+    上报/放行响应的 `advancement` 带 `"looped": true`、`loop_end`、
+    `loop_count` 与新的 `progress_epoch`；此后演员须携带**新代际**上报，
+    旧代际的迟到/重试事件返回 **409**。
+  - **与止点叠加**：终点（或更早）上存在未释放止点时不回环——自动推进先走
+    止点逻辑**只停在终点**并记录阻挡信息，参与者最新位置原样保留；导演放行
+    后按**当前活跃进度**重算：quorum 仍达到/越过终点且终点前已无止点时立即
+    回环，不满足 quorum（如有人离线）则停在原地等待重新汇聚。区间内终点之前
+    的止点照常阻挡，全部放行后才可能回环。
+  - **台本变更清除**：整体导入与增量修订都会清除循环；**此前确有循环时递增
+    `loop_version`**，使在途的循环设置请求失效。整体导入同时把 `loop_count`
+    清零；增量修订保留累计 `loop_count`。导演校准（cursor）不改变循环配置。
+  - `loop_version` 与 `revision`、`progress_epoch`、`hold_version`、
+    `clock_version` 相互独立；回环本身不递增 `loop_version`。
 - **离线超时**：超过超时未上报的参与者退出活跃成员列表与推进人数计算；
   重新上报后自动回到活跃集合。
 - **排练暂停/恢复**（`PUT /rooms/{room_id}/clock`，请求体
@@ -203,14 +265,17 @@ curl -X POST http://localhost:8000/rooms/demo/holds/release \
 - **推进原因**：每次推进记录促成的参与者名单与可读原因，可在
   `/state`（最近一次）与 `/advancements`（全部历史）中查询。导演校准记录
   的 `contributors` 为空数组、原因为“导演校准公共位置”；公共位置被止点
-  挡下时也会写入一条位置为止点的推进记录（`contributors` 为空）。
+  挡下时也会写入一条位置为止点的推进记录（`contributors` 为空）；循环
+  回环写入一条位置为起点的记录（原因为“循环排练”，`contributors` 为
+  达到/越过终点的参与者）。
 - **台本版本（revision）**：房间创建时为 0，每次整体导入或增量修订后递增；
   `GET /rooms`、`GET /rooms/{room_id}/lines` 与 `GET /rooms/{room_id}/state`
   均返回当前版本。revision 与 progress_epoch 相互独立：增量修订不改变
   进度代际，导演校准不改变台本版本。
 - **台词导入**：整体替换台本并重置房间进度（公共位置、参与者、推进历史），
   同时开启新版本（`revision` 递增）与新进度代际（`progress_epoch` 递增），
-  使重导前在途的旧代际上报全部失效。
+  使重导前在途的旧代际上报全部失效；同时清空全部止点与循环排练区间
+  （此前确有配置时递增对应版本），并把 `loop_count` 清零。
 - **台本增量修订**：`PATCH /rooms/{room_id}/lines` 携带 `base_revision` 与一组
   按**当前行号**执行的 `insert` / `replace` / `delete` 操作，整批在事务中校验、
   原子生效：
@@ -221,10 +286,17 @@ curl -X POST http://localhost:8000/rooms/demo/holds/release \
     重排：保留（含被替换）的台词跟随新位置，被删除的回退到最近仍保留的
     前一行，无前一行则置为 `-1`；未释放**止点**同样按台词身份重排，被删
     台词上的止点移除。修订本身**不产生推进记录**。
+  - 增量修订始终**清除循环排练区间**（行号语义已变）：此前确有循环时递增
+    `loop_version` 使在途设置请求失效；累计 `loop_count` 保留。
 - **状态接口字段**：`/state` 除活跃成员、公共位置、推进原因外，还返回
   `hold_version`（止点版本，初值 0）、`pending_holds`（当前未释放止点
   位置列表，升序）与 `last_block`（最近一次阻挡信息；无阻挡为 `null`，
-  正常推进、校准或修订后清除）。
+  正常推进、校准或修订后清除），以及循环相关的 `loop_version`（循环版本，
+  初值 0）、`loop_count`（累计回环次数）与 `loop` 对象：
+  `{"enabled": bool, "start": 行号|null, "end": 行号|null, "loop_version",
+  "loop_count"}`（未启用时 `start`/`end` 为 `null`，顶层同时冗余返回
+  `loop_version` 与 `loop_count`；`GET /rooms/{room_id}` 也返回
+  `loop_version`）。
 - 时间字段均为 epoch 秒（浮点）；`state.server_time` 可用于对齐超时判断。
 
 ## 本地开发（不用 Docker）

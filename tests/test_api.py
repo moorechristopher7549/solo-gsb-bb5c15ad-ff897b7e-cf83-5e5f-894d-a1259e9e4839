@@ -197,9 +197,11 @@ def test_reimport_lines_resets_progress(client):
         "lines_imported": 2,
         "progress_reset": True,
         "holds_cleared": True,
+        "loop_cleared": True,
         "revision": 2,  # 首次导入为 1，整体替换再开启新版本
         "progress_epoch": 2,  # 首次导入为 1，整体导入再开启新代际
         "hold_version": 0,  # 首次导入不存在止点，止点版本保持初值
+        "loop_version": 0,  # 首次导入不存在循环，循环版本保持初值
     }
 
     current = state(client, room_id)
@@ -1479,3 +1481,551 @@ def test_duplicate_event_at_hold_does_not_refresh_block(client):
     dup = report(client, room_id, "actor-a", 1, 4)
     assert dup.json()["applied"] is False
     assert state(client, room_id)["last_block"]["at"] == block_at
+
+
+# ---------------------------------------------------------------------------
+# 循环排练区间（PUT /rooms/{room_id}/loop）与 loop_version / loop_count
+# ---------------------------------------------------------------------------
+
+def put_loop(client, room_id, expected_loop_version, start=None, end=None):
+    return client.put(f"/rooms/{room_id}/loop", json={
+        "expected_loop_version": expected_loop_version,
+        "start": start,
+        "end": end,
+    })
+
+
+def clear_loop(client, room_id, expected_loop_version):
+    return client.put(f"/rooms/{room_id}/loop", json={
+        "expected_loop_version": expected_loop_version,
+    })
+
+
+def test_state_exposes_loop_fields_starting_empty(client):
+    room_id = make_room(client)
+    current = state(client, room_id)
+    assert current["loop_version"] == 0
+    assert current["loop_count"] == 0
+    assert current["loop"] == {
+        "enabled": False, "start": None, "end": None,
+        "loop_version": 0, "loop_count": 0,
+    }
+    assert client.get(f"/rooms/{room_id}").json()["loop_version"] == 0
+
+
+def test_set_loop_validates_and_enables(client):
+    room_id = make_room(client)  # 5 行，public_position=-1
+    resp = put_loop(client, room_id, 0, start=1, end=3)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["changed"] is True
+    assert body["enabled"] is True
+    assert body["start"] == 1
+    assert body["end"] == 3
+    assert body["loop_version"] == 1
+    assert body["loop_count"] == 0
+    assert body["state"]["loop"] == {
+        "enabled": True, "start": 1, "end": 3,
+        "loop_version": 1, "loop_count": 0,
+    }
+    current = state(client, room_id)
+    assert current["loop_version"] == 1
+    assert current["loop"]["enabled"] is True
+    assert current["loop"]["start"] == 1 and current["loop"]["end"] == 3
+
+
+def test_set_loop_validation_errors(client):
+    room_id = make_room(client)  # 5 行，位置 0..4
+    # 只给一个端点：请求体校验 422
+    assert put_loop(client, room_id, 0, start=1).status_code == 422
+    assert put_loop(client, room_id, 0, end=3).status_code == 422
+    # 起点等于/大于终点：请求体校验 422
+    assert put_loop(client, room_id, 0, start=3, end=3).status_code == 422
+    assert put_loop(client, room_id, 0, start=4, end=3).status_code == 422
+    # 负数：请求体校验 422
+    assert put_loop(client, room_id, 0, start=-1, end=3).status_code == 422
+    # 缺少版本号：请求体校验 422
+    assert client.put(f"/rooms/{room_id}/loop", json={"start": 1, "end": 3}).status_code == 422
+    # 终点越出台本：422，状态不变
+    assert put_loop(client, room_id, 0, start=1, end=5).status_code == 422
+    assert state(client, room_id)["loop_version"] == 0
+    assert state(client, room_id)["loop"]["enabled"] is False
+
+
+def test_set_loop_end_must_be_above_public_position(client):
+    room_id = make_room(client, threshold=1)
+    report(client, room_id, "actor-a", 1, 3)
+    assert state(client, room_id)["public_position"] == 3
+
+    # 终点等于当前公共位置：422
+    resp = put_loop(client, room_id, 0, start=1, end=3)
+    assert resp.status_code == 422, resp.text
+    # 终点低于当前公共位置：422
+    assert put_loop(client, room_id, 0, start=0, end=2).status_code == 422
+    # 起点可以低于当前公共位置（起点不限制），只要终点更高即可
+    resp = put_loop(client, room_id, 0, start=1, end=4)
+    assert resp.status_code == 200, resp.text
+    assert state(client, room_id)["loop_version"] == 1
+
+
+def test_set_loop_before_lines_imported_rejected(client):
+    room_id = "room-" + uuid.uuid4().hex[:8]
+    client.post("/rooms", json={
+        "id": room_id, "name": "空房间",
+        "advance_threshold": 1, "offline_timeout_seconds": 30,
+    })
+    assert put_loop(client, room_id, 0, start=0, end=0).status_code == 422  # start>=end
+    resp = put_loop(client, room_id, 0, start=0, end=1)
+    assert resp.status_code == 409, resp.text
+    assert state(client, room_id)["loop"]["enabled"] is False
+
+
+def test_set_loop_version_mismatch_returns_409(client):
+    room_id = make_room(client)
+    assert put_loop(client, room_id, 99, start=1, end=3).status_code == 409
+    put_loop(client, room_id, 0, start=1, end=3)  # loop_version -> 1
+    # 以旧版本改区间：409，状态不变
+    resp = put_loop(client, room_id, 0, start=0, end=4)
+    assert resp.status_code == 409
+    current = state(client, room_id)
+    assert current["loop_version"] == 1
+    assert (current["loop"]["start"], current["loop"]["end"]) == (1, 3)
+
+
+def test_set_loop_same_target_is_idempotent_no_version_bump(client):
+    room_id = make_room(client)
+    put_loop(client, room_id, 0, start=1, end=3)
+    # 相同区间（即使携带过期版本号）：幂等空操作，版本不递增
+    resp = put_loop(client, room_id, 0, start=1, end=3)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["changed"] is False
+    assert body["loop_version"] == 1
+    assert state(client, room_id)["loop_version"] == 1
+
+    # 重复清除已清除的循环：同样是空操作
+    room2 = make_room(client)
+    resp = clear_loop(client, room2, 0)
+    assert resp.status_code == 200
+    assert resp.json()["changed"] is False
+    assert resp.json()["loop_version"] == 0
+    # 过期版本号也视为成功重试
+    assert clear_loop(client, room2, 99).json()["changed"] is False
+
+
+def test_clear_loop_bumps_version_and_disables(client):
+    room_id = make_room(client)
+    put_loop(client, room_id, 0, start=1, end=3)
+    resp = clear_loop(client, room_id, 1)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["changed"] is True
+    assert body["enabled"] is False
+    assert body["start"] is None and body["end"] is None
+    assert body["loop_version"] == 2
+    current = state(client, room_id)
+    assert current["loop"]["enabled"] is False
+    assert current["loop"]["start"] is None and current["loop"]["end"] is None
+    assert current["loop_version"] == 2
+    # 清除后旧版本的在途设置请求失效
+    assert put_loop(client, room_id, 1, start=0, end=2).status_code == 409
+
+
+def test_loop_wraps_at_end_in_same_transaction(client):
+    room_id = make_room(client, threshold=2)  # 5 行
+    put_loop(client, room_id, 0, start=1, end=3)
+    assert state(client, room_id)["progress_epoch"] == 1
+
+    report(client, room_id, "actor-a", 1, 3)
+    resp = report(client, room_id, "actor-b", 1, 3)
+    adv = resp.json()["advancement"]
+    # quorum 达到终点：同一事务内回环到起点
+    assert adv["looped"] is True
+    assert adv["position"] == 1
+    assert adv["loop_end"] == 3
+    assert adv["loop_count"] == 1
+    assert adv["progress_epoch"] == 2
+    assert set(adv["contributors"]) == {"actor-a", "actor-b"}
+
+    current = state(client, room_id)
+    assert current["public_position"] == 1
+    assert current["current_line"] == {"position": 1, "text": "乙：来了？"}
+    assert current["progress_epoch"] == 2
+    assert current["loop_count"] == 1
+    assert current["loop"]["loop_count"] == 1
+    # 参与者进度已清空
+    assert current["active_participants"] == []
+
+    # 旧代际（1）的迟到/重试上报返回 409
+    stale = report(client, room_id, "actor-a", 2, 3, progress_epoch=1)
+    assert stale.status_code == 409
+    assert state(client, room_id)["active_participants"] == []
+
+    # 新代际下重新汇聚，可再次回环并累加次数
+    report(client, room_id, "actor-a", 1, 3, progress_epoch=2)
+    resp = report(client, room_id, "actor-b", 1, 3, progress_epoch=2)
+    adv = resp.json()["advancement"]
+    assert adv["looped"] is True
+    assert adv["position"] == 1
+    assert adv["loop_count"] == 2
+    assert adv["progress_epoch"] == 3
+    current = state(client, room_id)
+    assert current["public_position"] == 1
+    assert current["loop_count"] == 2
+    assert current["progress_epoch"] == 3
+
+    # 推进历史包含两次回环记录
+    history = client.get(f"/rooms/{room_id}/advancements").json()["advancements"]
+    assert [a["position"] for a in history] == [1, 1]
+    assert all("循环" in a["reason"] for a in history)
+
+
+def test_loop_wraps_when_quorum_crosses_beyond_end(client):
+    room_id = make_room(client, threshold=2)
+    put_loop(client, room_id, 0, start=0, end=3)
+    # quorum 候选为 4（越过终点 3）：同样回环
+    report(client, room_id, "actor-a", 1, 4)
+    resp = report(client, room_id, "actor-b", 1, 4)
+    adv = resp.json()["advancement"]
+    assert adv["looped"] is True
+    assert adv["position"] == 0
+    assert adv["loop_count"] == 1
+
+
+def test_loop_does_not_wrap_before_reaching_end(client):
+    room_id = make_room(client, threshold=2)
+    put_loop(client, room_id, 0, start=1, end=4)
+    report(client, room_id, "actor-a", 1, 2)
+    resp = report(client, room_id, "actor-b", 1, 2)
+    adv = resp.json()["advancement"]
+    assert adv is not None
+    assert "looped" not in adv
+    assert adv["position"] == 2
+    current = state(client, room_id)
+    assert current["public_position"] == 2
+    assert current["loop_count"] == 0
+    assert current["progress_epoch"] == 1
+    assert len(current["active_participants"]) == 2
+
+
+def test_loop_pending_hold_at_end_stops_then_release_wraps(client):
+    room_id = make_room(client, threshold=2)
+    put_loop(client, room_id, 0, start=1, end=3)
+    set_holds(client, room_id, 0, [3])  # 终点上存在未释放止点
+
+    # quorum 越过终点：只停在终点，不回环
+    report(client, room_id, "actor-a", 1, 4)
+    resp = report(client, room_id, "actor-b", 1, 4)
+    adv = resp.json()["advancement"]
+    assert adv["blocked"] is True
+    assert adv["position"] == 3
+    assert "looped" not in adv
+    current = state(client, room_id)
+    assert current["public_position"] == 3
+    assert current["loop_count"] == 0
+    assert current["progress_epoch"] == 1
+    # 参与者进度保留
+    assert participant_positions(client, room_id) == {"actor-a": 4, "actor-b": 4}
+
+    # 放行终点止点：hold_version 递增后按当前活跃进度重算，满足条件即回环
+    resp = release_holds(client, room_id, 1, [3])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["hold_version"] == 2
+    assert body["pending_holds"] == []
+    adv = body["advancement"]
+    assert adv["looped"] is True
+    assert adv["position"] == 1
+    assert adv["loop_count"] == 1
+    assert body["state"]["public_position"] == 1
+    current = state(client, room_id)
+    assert current["public_position"] == 1
+    assert current["progress_epoch"] == 2
+    assert current["active_participants"] == []
+    assert current["loop_count"] == 1
+
+
+def test_loop_hold_before_end_blocks_normally(client):
+    room_id = make_room(client, threshold=1)
+    put_loop(client, room_id, 0, start=0, end=4)
+    set_holds(client, room_id, 0, [2])  # 区间内、终点之前的止点
+    resp = report(client, room_id, "actor-a", 1, 4)
+    # 常规止点阻挡：停在 2，不回环
+    adv = resp.json()["advancement"]
+    assert adv["blocked"] is True
+    assert adv["position"] == 2
+    assert "looped" not in adv
+    assert state(client, room_id)["public_position"] == 2
+    assert state(client, room_id)["loop_count"] == 0
+
+    # 放行 2：候选 4 越过终点 4（>=），区间内再无止点 → 回环
+    resp = release_holds(client, room_id, 1, [2])
+    assert resp.status_code == 200
+    adv = resp.json()["advancement"]
+    assert adv["looped"] is True
+    assert adv["position"] == 0
+
+
+def test_loop_release_without_quorum_does_not_wrap(client):
+    room_id = make_room(client, threshold=2, timeout=10)
+    put_loop(client, room_id, 0, start=1, end=3)
+    set_holds(client, room_id, 0, [3])
+    report(client, room_id, "actor-a", 1, 4)
+    report(client, room_id, "actor-b", 1, 4)
+    assert state(client, room_id)["public_position"] == 3
+
+    # 两名演员均已离线：放行后不满足 quorum，不回环
+    client.clock.advance(11)
+    resp = release_holds(client, room_id, 1, [3])
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["advancement"] is None
+    assert state(client, room_id)["public_position"] == 3
+    assert state(client, room_id)["loop_count"] == 0
+
+    # 两名演员先后重新上报到终点：quorum 重新满足，立即回环
+    assert report(client, room_id, "actor-a", 2, 4).json()["advancement"] is None
+    resp = report(client, room_id, "actor-b", 2, 4)
+    assert resp.status_code == 200
+    adv = resp.json()["advancement"]
+    assert adv["looped"] is True
+    assert adv["position"] == 1
+    assert state(client, room_id)["loop_count"] == 1
+
+
+def test_loop_wraps_after_release_even_when_position_already_at_end(client):
+    # 校准到终点后设置区间与终点止点，放行重算时公共位置已等于终点：
+    # 仍须按当前活跃进度判定回环，而不是被“只升不降”挡下
+    room_id = make_room(client, threshold=1)
+    report(client, room_id, "actor-a", 1, 3)
+    assert state(client, room_id)["public_position"] == 3
+    put_loop(client, room_id, 0, start=1, end=4)
+    set_holds(client, room_id, 0, [4])
+    report(client, room_id, "actor-a", 2, 4)  # 被挡在 4
+    assert state(client, room_id)["public_position"] == 4
+
+    resp = release_holds(client, room_id, 1, [4])
+    assert resp.status_code == 200, resp.text
+    adv = resp.json()["advancement"]
+    assert adv["looped"] is True
+    assert adv["position"] == 1
+    assert state(client, room_id)["public_position"] == 1
+    assert state(client, room_id)["loop_count"] == 1
+
+
+def test_loop_release_works_while_paused(client):
+    room_id = make_room(client, threshold=2, timeout=10)
+    put_loop(client, room_id, 0, start=1, end=3)
+    set_holds(client, room_id, 0, [3])
+    report(client, room_id, "actor-a", 1, 4)
+    report(client, room_id, "actor-b", 1, 4)
+    assert state(client, room_id)["public_position"] == 3
+    pause(client, room_id)
+
+    # 暂停期间导演放行：按冻结的活跃集合重算，满足条件即回环
+    client.clock.advance(1000)
+    resp = release_holds(client, room_id, 1, [3])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["advancement"]["looped"] is True
+    assert body["state"]["paused"] is True
+    current = state(client, room_id)
+    assert current["public_position"] == 1
+    assert current["loop_count"] == 1
+    assert current["progress_epoch"] == 2
+    # 暂停期间演员仍不能上报（含新代际）
+    assert report(client, room_id, "actor-a", 1, 3, progress_epoch=2).status_code == 409
+
+
+def test_import_lines_clears_loop_and_bumps_version(client):
+    room_id = make_room(client, threshold=1)
+    put_loop(client, room_id, 0, start=1, end=3)
+    report(client, room_id, "actor-a", 1, 3)  # 回环一次
+    assert state(client, room_id)["loop_count"] == 1
+    assert state(client, room_id)["loop_version"] == 1
+
+    # 整体导入清除循环：实际清除递增 loop_version，并清零回环次数
+    resp = client.post(f"/rooms/{room_id}/lines", json={"lines": ["新台词一", "新台词二"]})
+    assert resp.status_code == 200
+    assert resp.json()["loop_cleared"] is True
+    assert resp.json()["loop_version"] == 2
+    current = state(client, room_id)
+    assert current["loop"]["enabled"] is False
+    assert current["loop_version"] == 2
+    assert current["loop_count"] == 0
+
+    # 旧 loop_version 的在途设置请求失效
+    assert put_loop(client, room_id, 1, start=0, end=1).status_code == 409
+
+
+def test_import_lines_without_loop_does_not_bump_loop_version(client):
+    room_id = make_room(client)
+    resp = client.post(f"/rooms/{room_id}/lines", json={"lines": ["新台词一", "新台词二"]})
+    assert resp.json()["loop_version"] == 0
+    assert state(client, room_id)["loop_version"] == 0
+
+
+def test_patch_lines_clears_loop_and_bumps_version(client):
+    room_id = make_room(client, threshold=1)
+    put_loop(client, room_id, 0, start=1, end=4)
+    report(client, room_id, "actor-a", 1, 4)  # 回环一次
+    assert state(client, room_id)["loop_version"] == 1
+    assert state(client, room_id)["loop_count"] == 1
+
+    # 增量修订清除循环：实际清除递增 loop_version；累计回环次数保留
+    resp = patch_lines(client, room_id, 1, [
+        {"op": "insert", "position": 0, "text": "导演：开机。"},
+    ])
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["loop_cleared"] is True
+    assert body["loop_version"] == 2
+    current = state(client, room_id)
+    assert current["loop"]["enabled"] is False
+    assert current["loop_version"] == 2
+    assert current["loop_count"] == 1  # 修订不清零累计回环次数
+
+    # 旧 loop_version 的在途设置请求失效
+    assert put_loop(client, room_id, 1, start=0, end=2).status_code == 409
+
+
+def test_patch_lines_without_loop_does_not_bump_loop_version(client):
+    room_id = make_room(client)
+    resp = patch_lines(client, room_id, 1, [{"op": "delete", "position": 0}])
+    assert resp.json()["loop_cleared"] is False
+    assert resp.json()["loop_version"] == 0
+    assert state(client, room_id)["loop_version"] == 0
+
+
+def test_loop_unknown_room_returns_404(client):
+    assert put_loop(client, "nope", 0, start=0, end=1).status_code == 404
+    assert clear_loop(client, "nope", 0).status_code == 404
+
+
+def test_loop_independent_of_holds_and_cursor_versions(client):
+    # loop_version 与 progress_epoch / hold_version / clock_version 互不影响
+    room_id = make_room(client, threshold=1)
+    put_loop(client, room_id, 0, start=1, end=3)
+    set_holds(client, room_id, 0, [3])
+    # 校准到 2：止点 3 在目标之后，保留且不递增 hold_version；epoch → 2
+    put_cursor(client, room_id, 1, 2)
+    pause(client, room_id, expected=0)
+    current = state(client, room_id)
+    assert current["loop_version"] == 1
+    assert current["hold_version"] == 1
+    assert current["progress_epoch"] == 2
+    assert current["clock_version"] == 1
+    # 循环配置不随其他版本操作改变
+    assert (current["loop"]["start"], current["loop"]["end"]) == (1, 3)
+    assert current["pending_holds"] == [3]
+    resume(client, room_id, expected=1)
+
+    # 新代际上报到终点：终点止点未释放，只停在终点
+    report(client, room_id, "actor-a", 1, 3, progress_epoch=2)
+    assert state(client, room_id)["public_position"] == 3
+
+    # 放行终点触发回环：progress_epoch 与 loop_count 递增，hold_version 因
+    # 放行递增，但 loop_version 与 clock_version 不随回环变化
+    resp = release_holds(client, room_id, 1, [3])
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["advancement"]["looped"] is True
+    current = state(client, room_id)
+    assert current["loop_count"] == 1
+    assert current["progress_epoch"] == 3
+    assert current["hold_version"] == 2
+    assert current["loop_version"] == 1
+    assert current["clock_version"] == 2
+    assert current["paused"] is False
+    assert (current["loop"]["start"], current["loop"]["end"]) == (1, 3)
+
+
+def test_loop_director_cursor_jump_past_end_does_not_wrap_spuriously(client):
+    # 导演手动校准越过终点（位置 > end）：之后不超过公共位置的上报不回环
+    room_id = make_room(client, threshold=1)
+    put_loop(client, room_id, 0, start=1, end=3)
+    put_cursor(client, room_id, 1, 4)  # epoch → 2，公共位置 4
+    assert state(client, room_id)["public_position"] == 4
+    assert state(client, room_id)["loop_count"] == 0
+
+    # 新代际上报到终点 3：candidate 3 < 公共位置 4，不回环、不推进
+    resp = report(client, room_id, "actor-a", 1, 3, progress_epoch=2)
+    assert resp.status_code == 200
+    assert resp.json()["advancement"] is None
+    current = state(client, room_id)
+    assert current["public_position"] == 4
+    assert current["loop_count"] == 0
+    assert current["progress_epoch"] == 2
+
+    # 导演回退到终点 3 后，再次上报到终点：公共位置已在终点，
+    # 新上报构成到达终点的活跃进度，立即回环
+    put_cursor(client, room_id, 2, 3)  # epoch → 3，参与者清空
+    resp = report(client, room_id, "actor-a", 1, 3, progress_epoch=3)
+    assert resp.status_code == 200
+    adv = resp.json()["advancement"]
+    assert adv["looped"] is True
+    assert adv["position"] == 1
+    assert state(client, room_id)["loop_count"] == 1
+
+
+def test_loop_director_cursor_to_end_then_report_wraps(client):
+    # 导演校准恰至终点（无终点止点）：下一次 quorum 到终点的上报即回环
+    room_id = make_room(client, threshold=2)
+    put_loop(client, room_id, 0, start=0, end=3)
+    put_cursor(client, room_id, 1, 3)  # epoch → 2
+    report(client, room_id, "actor-a", 1, 3, progress_epoch=2)
+    resp = report(client, room_id, "actor-b", 1, 3, progress_epoch=2)
+    adv = resp.json()["advancement"]
+    assert adv["looped"] is True
+    assert adv["position"] == 0
+    current = state(client, room_id)
+    assert current["loop_count"] == 1
+    assert current["progress_epoch"] == 3
+    assert current["active_participants"] == []
+
+
+def test_loop_setting_does_not_recompute_or_change_progress(client):
+    # 设置/清除循环本身不触发推进重算、不改变公共位置/代际/参与者
+    room_id = make_room(client, threshold=1)
+    report(client, room_id, "actor-a", 1, 2)  # 公共位置先推进到 2
+    before = state(client, room_id)
+    assert before["public_position"] == 2
+    resp = put_loop(client, room_id, 0, start=0, end=4)
+    assert resp.status_code == 200
+    after = state(client, room_id)
+    assert after["public_position"] == before["public_position"]
+    assert after["progress_epoch"] == before["progress_epoch"]
+    assert len(after["active_participants"]) == 1
+    # 已有参与者继续汇聚；同一参与者上报越过终点 4 时回环
+    report2 = report(client, room_id, "actor-a", 2, 4)
+    assert report2.json()["advancement"]["looped"] is True
+
+
+def test_clear_loop_then_reports_advance_normally_without_wrapping(client):
+    room_id = make_room(client, threshold=1)
+    put_loop(client, room_id, 0, start=1, end=3)
+    clear_loop(client, room_id, 1)  # loop_version → 2
+    # 循环已清除：越过原终点也只是普通推进，不回环
+    resp = report(client, room_id, "actor-a", 1, 4)
+    adv = resp.json()["advancement"]
+    assert adv["position"] == 4
+    assert "looped" not in adv
+    current = state(client, room_id)
+    assert current["public_position"] == 4
+    assert current["loop_count"] == 0
+    assert current["progress_epoch"] == 1
+    assert len(current["active_participants"]) == 1
+
+
+def test_patch_clears_loop_even_without_wrapping_history(client):
+    # 从未回环过的循环也会被修订清除；版本实际递增
+    room_id = make_room(client)
+    put_loop(client, room_id, 0, start=0, end=4)  # loop_version 0 → 1
+    resp = patch_lines(client, room_id, 1, [{"op": "replace", "position": 2, "text": "甲：改。"}])
+    assert resp.json()["loop_cleared"] is True
+    assert resp.json()["loop_version"] == 2  # 设置占 1，修订清除占 2
+    current = state(client, room_id)
+    assert current["loop"]["enabled"] is False
+    assert current["loop_count"] == 0
+    # 旧版本号失效：再设置新区间必须携带 2
+    assert put_loop(client, room_id, 1, start=0, end=2).status_code == 409
+    assert put_loop(client, room_id, 2, start=0, end=2).status_code == 200

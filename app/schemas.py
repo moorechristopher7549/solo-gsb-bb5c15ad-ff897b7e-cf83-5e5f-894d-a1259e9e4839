@@ -40,9 +40,9 @@ class LinesImport(BaseModel):
 class EventReport(BaseModel):
     """演员上报：参与者 ID、单调递增事件序号、已到达的台词位置。
 
-    ``progress_epoch`` 必须与房间当前进度代际一致；导演校准公共位置或台本
-    整体重导会开启新代际，旧代际的迟到/重试上报一律返回 409，不能再推进
-    房间。当前代际可通过 ``GET /rooms/{room_id}/state`` 查询。
+    ``progress_epoch`` 必须与房间当前进度代际一致；导演校准公共位置、循环
+    回环或台本整体重导会开启新代际，旧代际的迟到/重试上报一律返回 409，
+    不能再推进房间。当前代际可通过 ``GET /rooms/{room_id}/state`` 查询。
     """
 
     participant_id: str = Field(min_length=1, max_length=100)
@@ -155,3 +155,30 @@ class HoldsRelease(BaseModel):
         if len(set(value)) != len(value):
             raise ValueError("放行位置存在重复")
         return value
+
+
+class LoopUpdate(BaseModel):
+    """导演设置或清除循环排练区间：携带循环版本做乐观并发控制。
+
+    同时给出 ``start`` 与 ``end`` 表示设置区间（start < end，均须属于当前
+    台本，且 end 严格高于当前公共位置）；两者都省略（null）表示清除循环。
+    目标配置与当前一致时为幂等空操作，``loop_version`` 不递增。
+    """
+
+    expected_loop_version: int = Field(
+        ge=0, description="客户端已知的 loop_version；与当前不一致时返回 409"
+    )
+    start: Optional[int] = Field(
+        default=None, ge=0, description="循环起点行号（从 0 开始）；与 end 同时给出"
+    )
+    end: Optional[int] = Field(
+        default=None, ge=0, description="循环终点行号；quorum 达到或越过且无未释放止点时回环"
+    )
+
+    @model_validator(mode="after")
+    def _check_pair_and_order(self) -> "LoopUpdate":
+        if (self.start is None) != (self.end is None):
+            raise ValueError("start 与 end 必须同时给出（设置区间）或同时省略（清除循环）")
+        if self.start is not None and self.start >= self.end:
+            raise ValueError(f"循环起点必须小于终点: start={self.start}, end={self.end}")
+        return self
