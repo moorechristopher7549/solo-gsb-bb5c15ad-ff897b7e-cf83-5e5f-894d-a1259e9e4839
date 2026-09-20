@@ -155,3 +155,32 @@ class HoldsRelease(BaseModel):
         if len(set(value)) != len(value):
             raise ValueError("放行位置存在重复")
         return value
+
+
+class LoopRange(BaseModel):
+    """循环排练区间：从 ``start`` 到 ``end``（均为台词行号，含两端）。"""
+
+    start: int = Field(ge=0, description="循环起点台词位置（从 0 开始）")
+    end: int = Field(ge=0, description="循环终点台词位置（从 0 开始，必须高于起点）")
+
+    @model_validator(mode="after")
+    def _check_order(self) -> "LoopRange":
+        if self.end <= self.start:
+            raise ValueError("循环终点必须高于（行号严格大于）起点")
+        return self
+
+
+class LoopUpdate(BaseModel):
+    """导演设置或清除循环排练区间，携带循环配置版本做乐观并发控制。
+
+    ``range`` 为区间对象时设置循环（起止行须属于当前台本，起点小于终点，
+    终点高于当前公共位置）；为 ``null`` 时清除循环。目标与当前配置一致时
+    为幂等空操作，``loop_version`` 不递增。
+    """
+
+    expected_loop_version: int = Field(
+        ge=0, description="客户端已知的 loop_version；与当前不一致时返回 409"
+    )
+    range: Optional[LoopRange] = Field(
+        description="循环区间；null 表示清除循环"
+    )

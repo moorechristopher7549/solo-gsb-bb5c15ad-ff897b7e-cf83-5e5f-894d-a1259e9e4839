@@ -23,9 +23,13 @@ CREATE TABLE IF NOT EXISTS rooms (
     paused                 INTEGER NOT NULL DEFAULT 0,  -- 排练是否暂停
     clock_version          INTEGER NOT NULL DEFAULT 0,  -- 暂停/恢复每切换一次递增
     paused_at              REAL,                        -- 本次暂停开始的 epoch 秒
-    progress_epoch         INTEGER NOT NULL DEFAULT 0,  -- 进度代际：导演跳转/重导台本递增
+    progress_epoch         INTEGER NOT NULL DEFAULT 0,  -- 进度代际：导演跳转/重导台本/回环递增
     hold_version           INTEGER NOT NULL DEFAULT 0,  -- 止点版本：设置/放行/越点/重导递增
     last_block             TEXT,                        -- JSON：最近一次被止点阻挡的信息
+    loop_start             INTEGER,                     -- 循环排练区间起点（NULL=未启用）
+    loop_end               INTEGER,                     -- 循环排练区间终点（NULL=未启用）
+    loop_version           INTEGER NOT NULL DEFAULT 0,  -- 循环配置版本：设置/清除/重导/修订递增
+    loop_count             INTEGER NOT NULL DEFAULT 0,  -- 已回环次数（整体导入清零）
     created_at             REAL NOT NULL
 );
 
@@ -101,8 +105,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
 
     - rooms.revision：台本版本号
     - rooms.paused / clock_version / paused_at：排练暂停/恢复时钟
-    - rooms.progress_epoch：进度代际（导演校准公共位置 / 重导台本时递增）
+    - rooms.progress_epoch：进度代际（导演校准公共位置 / 重导台本 / 回环时递增）
     - rooms.hold_version / last_block：台词止点版本与最近一次阻挡信息
+    - rooms.loop_start / loop_end / loop_version / loop_count：循环排练区间
+      （起止行、配置版本与已回环次数）
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(rooms)")}
     if "revision" not in columns:
@@ -132,4 +138,16 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "last_block" not in columns:
         conn.execute(
             "ALTER TABLE rooms ADD COLUMN last_block TEXT"
+        )
+    if "loop_start" not in columns:
+        conn.execute("ALTER TABLE rooms ADD COLUMN loop_start INTEGER")
+    if "loop_end" not in columns:
+        conn.execute("ALTER TABLE rooms ADD COLUMN loop_end INTEGER")
+    if "loop_version" not in columns:
+        conn.execute(
+            "ALTER TABLE rooms ADD COLUMN loop_version INTEGER NOT NULL DEFAULT 0"
+        )
+    if "loop_count" not in columns:
+        conn.execute(
+            "ALTER TABLE rooms ADD COLUMN loop_count INTEGER NOT NULL DEFAULT 0"
         )

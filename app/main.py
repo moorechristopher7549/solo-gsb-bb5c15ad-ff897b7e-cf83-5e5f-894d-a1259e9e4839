@@ -31,6 +31,14 @@ progress_epoch 并清空全部参与者进度；旧代际的迟到或重试上�
 参与者重算，满足条件可在同一响应中继续推进。增量修订后止点按原台词
 身份重排，被删台词上的止点移除；整体导入清空全部止点。手动校准不受
 止点限制，前跳越过的未释放止点自动释放。
+
+导演可为房间设置循环排练区间（PUT /rooms/{room_id}/loop，独立的
+loop_version 乐观锁）：区间起止行必须属于当前台本、起点小于终点且终点
+高于当前公共位置。启用后，quorum 达到或越过终点（且终点上没有未释放
+止点阻挡）时在同一事务把公共位置回到起点、progress_epoch 递增、清空
+参与者进度并累加 loop_count，使旧代际上报返回 409；终点上存在未释放
+止点时只停在终点，放行后按当前活跃进度重算，满足条件即回环。整体导入
+或增量修订台本时清除循环，实际清除递增 loop_version。
 """
 
 from __future__ import annotations
@@ -52,6 +60,7 @@ from .schemas import (
     HoldsSet,
     LinesImport,
     LinesPatch,
+    LoopUpdate,
     RoomCreate,
 )
 
@@ -69,7 +78,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="排练提词同步 API",
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -124,15 +133,33 @@ def _pending_holds(conn, room_id: str) -> List[int]:
     ]
 
 
-def _foremost_pending_hold(conn, room_id: str, at_or_after: int) -> Optional[int]:
-    """位置不小于 ``at_or_after`` 的最靠前未释放止点；不存在返回 None。"""
+def _foremost_pending_hold(
+    conn, room_id: str, at_or_after: int, at_most: Optional[int] = None,
+    strict: bool = False,
+) -> Optional[int]:
+    """最靠前的未释放止点；不存在返回 None。
+
+    ``strict=False``（默认，非循环推进路径）时取位置不小于
+    ``at_or_after`` 的止点：公共位置停在止点（被挡或导演校准到止点行）时，
+    位置等于当前公共位置的止点仍会被计入，越过它的上报依旧被挡住，直至放行。
+    ``strict=True``（循环回环判定）时取位置严格大于 ``at_or_after`` 的止点：
+    已在身后（位置不高于当前公共位置）的止点不再阻挡回环。传入 ``at_most``
+    时只在对应范围内查找（循环区间内的止点判定用）。
+    """
+    lower_op = ">" if strict else ">="
+    upper = "AND position <= ?" if at_most is not None else ""
+    params: tuple
+    if at_most is None:
+        params = (room_id, at_or_after)
+    else:
+        params = (room_id, at_or_after, at_most)
     row = conn.execute(
-        """
+        f"""
         SELECT position FROM holds
-        WHERE room_id = ? AND released = 0 AND position >= ?
+        WHERE room_id = ? AND released = 0 AND position {lower_op} ? {upper}
         ORDER BY position LIMIT 1
         """,
-        (room_id, at_or_after),
+        params,
     ).fetchone()
     return None if row is None else row["position"]
 
@@ -146,6 +173,16 @@ def _maybe_advance(conn, room, now: float) -> Optional[Dict[str, Any]]:
     自动推进不得越过最靠前的未释放止点（位置不小于当前公共位置）：候选
     位置超过该止点时公共位置最多推进到止点本身，并把阻挡信息写入房间的
     ``last_block``；参与者上报的最新位置原样保留，待止点放行后再次重算。
+
+    启用循环排练区间后，quorum 达到或越过终点时回到起点开始下一轮：
+
+    - 终点上存在未释放止点时，公共位置只停在终点（按普通止点处理，记录
+      阻挡信息），不回环；止点放行后再次重算，满足条件即在同一事务回环；
+    - 区间内部（起点与终点之间）的未释放止点照常阻挡推进；终点之外的止点
+      与循环无关；
+    - 回环在同一事务中把公共位置置回起点、``progress_epoch`` 递增、清空
+      全部参与者进度并累加 ``loop_count``，使旧代际的迟到/重试上报返回
+      409。
     """
     threshold = room["advance_threshold"]
     ref_now = _reference_now(room, now)
@@ -154,27 +191,58 @@ def _maybe_advance(conn, room, now: float) -> Optional[Dict[str, Any]]:
         return None
     positions = sorted((row["position"] for row in rows), reverse=True)
     candidate = positions[threshold - 1]
+    loop_enabled = room["loop_start"] is not None
+
     if candidate <= room["public_position"]:
+        # 例外：公共位置停在循环终点（此前被终点止点挡住、止点放行后的重算），
+        # quorum 仍齐在终点且终点止点已不存在——满足回环条件，落入回环判定。
+        if (
+            loop_enabled
+            and room["public_position"] == room["loop_end"]
+            and candidate >= room["loop_end"]
+        ):
+            end_hold = _foremost_pending_hold(
+                conn, room["id"], room["loop_end"], room["loop_end"]
+            )
+            if end_hold is None:
+                return _loop_back(conn, room, now, candidate)
         return None
 
-    blocking = _foremost_pending_hold(conn, room["id"], room["public_position"])
-    if blocking is not None and candidate > blocking:
+    if loop_enabled and candidate >= room["loop_end"]:
+        # quorum 已达到/越过循环终点。区间内部（含终点、不低于当前公共位置）
+        # 的最靠前未释放止点仍按止点规则阻挡；终点之外的止点与循环无关。
+        # 没有任何区间内止点时，在同一事务回环到起点。
+        blocking: Optional[int] = _foremost_pending_hold(
+            conn, room["id"], room["public_position"], room["loop_end"], strict=True
+        )
+        if blocking is None:
+            return _loop_back(conn, room, now, candidate)
+        capped = room["loop_end"]
+    else:
+        blocking = _foremost_pending_hold(conn, room["id"], room["public_position"])
+        # 启用循环时自动推进不得越过终点（candidate 越过终点的情形上面已处理）
+        capped = min(candidate, room["loop_end"]) if loop_enabled else candidate
+
+    if blocking is not None and (candidate > blocking or (loop_enabled and blocking == room["loop_end"])):
         # 到达/停留在止点：公共位置最多推进到止点本身；参与者位置原样保留，
-        # 待止点放行后再次重算。
-        past = sorted(row["participant_id"] for row in rows if row["position"] > blocking)
+        # 待止点放行后再次重算。循环终点上的止点是特例：quorum 恰好达到终点
+        # （candidate == 止点）也必须停在终点并等待放行，放行后重算再回环，
+        # 不能按“恰好到达止点”的普通规则当作一次正常推进越过回环时机。
+        stop = blocking
+        past = sorted(row["participant_id"] for row in rows if row["position"] > stop)
         block_reason = (
-            f"自动推进被止点 {blocking} 阻挡：quorum 候选位置为 {candidate}"
+            f"自动推进被止点 {stop} 阻挡：quorum 候选位置为 {candidate}"
             f"（要求 {threshold} 人），最新位置越过止点的参与者："
             f"{', '.join(past) if past else '无'}"
         )
         last_block = {
-            "hold_position": blocking,
+            "hold_position": stop,
             "candidate_position": candidate,
             "reason": block_reason,
             "participants_past_hold": past,
             "at": now,
         }
-        if blocking <= room["public_position"]:
+        if stop <= room["public_position"]:
             # 已停在止点（如导演校准到该位置）后又有越过它的上报：位置不动，
             # 仅刷新最近一次阻挡信息，不重复写推进记录。
             conn.execute(
@@ -184,21 +252,21 @@ def _maybe_advance(conn, room, now: float) -> Optional[Dict[str, Any]]:
             return None
         reason = (
             f"{threshold} 名活跃参与者的 quorum 候选位置 {candidate} 越过止点 "
-            f"{blocking}，公共位置在止点前等待放行"
+            f"{stop}，公共位置在止点前等待放行"
         )
         conn.execute(
             "UPDATE rooms SET public_position = ?, last_block = ? WHERE id = ?",
-            (blocking, json.dumps(last_block, ensure_ascii=False), room["id"]),
+            (stop, json.dumps(last_block, ensure_ascii=False), room["id"]),
         )
         conn.execute(
             """
             INSERT INTO advancements (room_id, position, reason, contributors, created_at)
             VALUES (?, ?, ?, ?, ?)
             """,
-            (room["id"], blocking, reason, json.dumps([], ensure_ascii=False), now),
+            (room["id"], stop, reason, json.dumps([], ensure_ascii=False), now),
         )
         return {
-            "position": blocking,
+            "position": stop,
             "reason": reason,
             "contributors": [],
             "at": now,
@@ -206,7 +274,7 @@ def _maybe_advance(conn, room, now: float) -> Optional[Dict[str, Any]]:
             "block": last_block,
         }
 
-    target = candidate
+    target = capped
     contributors = sorted(row["participant_id"] for row in rows if row["position"] >= target)
     reason = (
         f"{len(contributors)} 名活跃参与者已到达台词 {target}"
@@ -226,6 +294,59 @@ def _maybe_advance(conn, room, now: float) -> Optional[Dict[str, Any]]:
     return {"position": target, "reason": reason, "contributors": contributors, "at": now}
 
 
+def _loop_back(conn, room, now: float, candidate: int) -> Dict[str, Any]:
+    """quorum 达到/越过循环终点且终点无未释放止点：同事务回环到起点。
+
+    原子完成：公共位置回到 ``loop_start``、``progress_epoch`` 递增（旧代际
+    的迟到/重试上报随即 409）、清空全部参与者进度（新代际从干净状态重新
+    汇聚）、``loop_count`` 累加，并写入一条“循环排练回环”推进记录。
+    """
+    start = room["loop_start"]
+    end = room["loop_end"]
+    new_epoch = room["progress_epoch"] + 1
+    new_loop_count = room["loop_count"] + 1
+    reason = (
+        f"循环排练区间 [{start}, {end}]：{room['advance_threshold']} 名活跃参与者的 "
+        f"quorum 候选位置 {candidate} 达到/越过终点 {end}，公共位置回到起点 "
+        f"{start}（progress_epoch {room['progress_epoch']} → {new_epoch}，"
+        f"loop_count {room['loop_count']} → {new_loop_count}）"
+    )
+    conn.execute(
+        """
+        UPDATE rooms
+        SET public_position = ?, progress_epoch = ?, loop_count = ?, last_block = NULL
+        WHERE id = ?
+        """,
+        (start, new_epoch, new_loop_count, room["id"]),
+    )
+    conn.execute("DELETE FROM participants WHERE room_id = ?", (room["id"],))
+    conn.execute(
+        """
+        INSERT INTO advancements (room_id, position, reason, contributors, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (room["id"], start, reason, json.dumps([], ensure_ascii=False), now),
+    )
+    return {
+        "position": start,
+        "reason": reason,
+        "contributors": [],
+        "at": now,
+        "looped": True,
+        "loop_start": start,
+        "loop_end": end,
+        "loop_count": new_loop_count,
+        "progress_epoch": new_epoch,
+    }
+
+
+def _loop_config(room) -> Optional[Dict[str, Any]]:
+    """循环配置；未启用时为 None。"""
+    if room["loop_start"] is None:
+        return None
+    return {"start": room["loop_start"], "end": room["loop_end"]}
+
+
 def _room_payload(room) -> Dict[str, Any]:
     return {
         "room_id": room["id"],
@@ -236,6 +357,8 @@ def _room_payload(room) -> Dict[str, Any]:
         "revision": room["revision"],
         "progress_epoch": room["progress_epoch"],
         "hold_version": room["hold_version"],
+        "loop_version": room["loop_version"],
+        "loop_count": room["loop_count"],
         "created_at": room["created_at"],
     }
 
@@ -297,6 +420,9 @@ def _state_payload(conn, room, now: float) -> Dict[str, Any]:
         "revision": room["revision"],
         "progress_epoch": room["progress_epoch"],
         "hold_version": room["hold_version"],
+        "loop": _loop_config(room),
+        "loop_version": room["loop_version"],
+        "loop_count": room["loop_count"],
         "pending_holds": pending_holds,
         "last_block": last_block,
         "public_position": public_position,
@@ -371,6 +497,8 @@ def import_lines(room_id: str, payload: LinesImport) -> Dict[str, Any]:
     （progress_epoch）递增，使重导前在途的旧代际上报全部失效（返回 409）。
     整体导入同时清空全部止点（含留档）、递增止点版本（hold_version）
     并清除最近一次阻挡信息，使重导前在途的止点设置/放行请求失效。
+    整体导入同时清除循环排练区间（起止行、loop_count 清零）；当此前确实
+    启用着循环时递增循环版本（loop_version），使在途的循环设置/清除请求失效。
     """
     conn = connect()
     try:
@@ -389,14 +517,19 @@ def import_lines(room_id: str, payload: LinesImport) -> Dict[str, Any]:
             "SELECT COUNT(*) AS c FROM holds WHERE room_id = ?", (room_id,)
         ).fetchone()["c"]
         new_hold_version = room["hold_version"] + (1 if existing_holds else 0)
+        # 同理：仅在原本确实启用着循环时，清除才递增 loop_version
+        loop_was_enabled = room["loop_start"] is not None
+        new_loop_version = room["loop_version"] + (1 if loop_was_enabled else 0)
         conn.execute(
             """
             UPDATE rooms
             SET public_position = -1, revision = ?, progress_epoch = ?,
-                hold_version = ?, last_block = NULL
+                hold_version = ?, last_block = NULL,
+                loop_start = NULL, loop_end = NULL, loop_version = ?, loop_count = 0
             WHERE id = ?
             """,
-            (new_revision, new_progress_epoch, new_hold_version, room_id),
+            (new_revision, new_progress_epoch, new_hold_version,
+             new_loop_version, room_id),
         )
         conn.execute("DELETE FROM participants WHERE room_id = ?", (room_id,))
         conn.execute("DELETE FROM advancements WHERE room_id = ?", (room_id,))
@@ -407,9 +540,11 @@ def import_lines(room_id: str, payload: LinesImport) -> Dict[str, Any]:
             "lines_imported": len(payload.lines),
             "progress_reset": True,
             "holds_cleared": True,
+            "loop_cleared": loop_was_enabled,
             "revision": new_revision,
             "progress_epoch": new_progress_epoch,
             "hold_version": new_hold_version,
+            "loop_version": new_loop_version,
         }
     except Exception:
         conn.rollback()
@@ -446,7 +581,8 @@ def patch_lines(room_id: str, payload: LinesPatch) -> Dict[str, Any]:
     整批不落库。修订成功后版本递增，参与者与公共位置按原先指向的台词
     身份重排：保留的台词跟随新位置，被删除的回退到最近仍保留的前一行，
     无前一行则置为 -1。未释放止点同样按原台词身份重排：保留的台词跟随
-    新位置，被删台词上的止点移除。修订本身不写入推进记录。
+    新位置，被删台词上的止点移除。循环排练区间一律清除（loop_count 保留），
+    实际清除递增 loop_version。修订本身不写入推进记录。
     """
     conn = connect()
     try:
@@ -571,10 +707,19 @@ def patch_lines(room_id: str, payload: LinesPatch) -> Dict[str, Any]:
             [(room_id, position, text) for position, text in enumerate(new_texts)],
         )
         new_revision = room["revision"] + 1
+        # 增量修订一律清除循环区间（新旧行号不再对应）；仅在原本确实启用着
+        # 循环时递增 loop_version，使在途的设置/清除请求失效；loop_count 保留
+        loop_was_enabled = room["loop_start"] is not None
+        new_loop_version = room["loop_version"] + (1 if loop_was_enabled else 0)
         # 阻挡信息引用的止点行号可能已随修订失效，一并清除
         conn.execute(
-            "UPDATE rooms SET public_position = ?, revision = ?, last_block = NULL WHERE id = ?",
-            (new_public_position, new_revision, room_id),
+            """
+            UPDATE rooms
+            SET public_position = ?, revision = ?, last_block = NULL,
+                loop_start = NULL, loop_end = NULL, loop_version = ?
+            WHERE id = ?
+            """,
+            (new_public_position, new_revision, new_loop_version, room_id),
         )
         conn.commit()
         return {
@@ -585,6 +730,8 @@ def patch_lines(room_id: str, payload: LinesPatch) -> Dict[str, Any]:
             "participants_remapped": remapped,
             "holds_remapped": holds_remapped,
             "holds_removed": holds_removed,
+            "loop_cleared": loop_was_enabled,
+            "loop_version": new_loop_version,
         }
     except Exception:
         conn.rollback()
@@ -1036,6 +1183,126 @@ def release_holds(room_id: str, payload: HoldsRelease) -> Dict[str, Any]:
     except Exception:
         conn.rollback()
         raise
+    finally:
+        conn.close()
+
+
+@app.put("/rooms/{room_id}/loop")
+def update_loop(room_id: str, payload: LoopUpdate) -> Dict[str, Any]:
+    """导演设置或清除循环排练区间。
+
+    请求体 ``range`` 为 ``{"start": <起点>, "end": <终点>}`` 时设置循环，
+    为 ``null`` 时清除循环；携带客户端已知的 ``loop_version`` 做乐观锁。
+    目标配置与当前完全一致（同为清除，或起止行完全相同）时为幂等空操作：
+    直接返回当前状态，``loop_version`` 不递增（即便携带过期版本也视为成功
+    重试）。否则校验 ``loop_version``，与当前版本不一致返回 409、状态不变；
+    房间尚未导入台词返回 409。设置时起点、终点必须属于当前台本
+    （``[0, 台词总数)``）、起点严格小于终点、终点高于当前公共位置，任一不
+    满足返回 422、状态不变。设置/清除本身不触发推进重算，也不改变止点、
+    时钟与进度代际；暂停期间导演仍可设置或清除循环。
+
+    启用后，演员上报或止点放行后的重算中 quorum 达到/越过终点（且终点上
+    没有未释放止点）时，在同一事务回环：公共位置回到起点、
+    ``progress_epoch`` 递增、清空全部参与者进度并累加 ``loop_count``，旧
+    代际的迟到/重试上报返回 409。
+    """
+    now = _now()
+    conn = connect()
+    try:
+        # 先在无锁状态下判断是否为幂等空操作，并重试友好
+        room = _get_room(conn, room_id)
+        target = None if payload.range is None else (payload.range.start, payload.range.end)
+        current = None if room["loop_start"] is None else (room["loop_start"], room["loop_end"])
+        if target == current:
+            return {
+                "changed": False,
+                "loop": _loop_config(room),
+                "loop_version": room["loop_version"],
+                "loop_count": room["loop_count"],
+                "state": _state_payload(conn, room, now),
+            }
+
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            room = _get_room(conn, room_id)
+            current = None if room["loop_start"] is None else (room["loop_start"], room["loop_end"])
+            if target == current:
+                conn.commit()  # 并发下可能已被其他请求改成同一配置
+                fresh = _get_room(conn, room_id)
+                return {
+                    "changed": False,
+                    "loop": _loop_config(fresh),
+                    "loop_version": fresh["loop_version"],
+                    "loop_count": fresh["loop_count"],
+                    "state": _state_payload(conn, fresh, now),
+                }
+            if payload.expected_loop_version != room["loop_version"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"循环配置版本不匹配: expected_loop_version="
+                        f"{payload.expected_loop_version}, 当前 loop_version="
+                        f"{room['loop_version']}"
+                    ),
+                )
+            lines_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM lines WHERE room_id = ?", (room_id,)
+            ).fetchone()["c"]
+            if lines_count == 0:
+                raise HTTPException(status_code=409, detail="房间尚未导入台词")
+
+            if payload.range is None:
+                conn.execute(
+                    """
+                    UPDATE rooms
+                    SET loop_start = NULL, loop_end = NULL, loop_version = ?
+                    WHERE id = ?
+                    """,
+                    (room["loop_version"] + 1, room_id),
+                )
+            else:
+                start, end = payload.range.start, payload.range.end
+                if start >= lines_count or end >= lines_count:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"循环区间越界: start={start}, end={end}, 台词总数={lines_count}"
+                        ),
+                    )
+                if start >= end:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"循环起点必须严格小于终点: start={start}, end={end}",
+                    )
+                if end <= room["public_position"]:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=(
+                            f"循环终点必须高于当前公共位置: end={end}, "
+                            f"当前 public_position={room['public_position']}"
+                        ),
+                    )
+                conn.execute(
+                    """
+                    UPDATE rooms
+                    SET loop_start = ?, loop_end = ?, loop_version = ?
+                    WHERE id = ?
+                    """,
+                    (start, end, room["loop_version"] + 1, room_id),
+                )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+        fresh = _get_room(conn, room_id)
+        return {
+            "changed": True,
+            "loop": _loop_config(fresh),
+            "loop_version": fresh["loop_version"],
+            "loop_count": fresh["loop_count"],
+            "state": _state_payload(conn, fresh, now),
+        }
     finally:
         conn.close()
 
